@@ -3,6 +3,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import math
 from numba import njit, prange
+import torch
 
 import rclpy
 from rclpy.node import Node
@@ -15,7 +16,6 @@ from sensor_msgs.msg import PointField
 from sensor_msgs.msg import CameraInfo
 from std_msgs.msg import Header
 
-import torch
 # import torchvision.transforms as tf
 # from torchvision.models.segmentation import lraspp_mobilenet_v3_large
 # from torchvision.models.segmentation.lraspp import LRASPPHead
