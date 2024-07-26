@@ -9,7 +9,7 @@ from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
-import sensor_msgs.point_cloud2 as pcl2
+import sensor_msgs.msg._point_cloud2 as pcl2
 from sensor_msgs.msg import PointCloud2
 from sensor_msgs.msg import PointField
 from sensor_msgs.msg import CameraInfo
@@ -30,6 +30,8 @@ MODEL_PATH = "LRSPP.torch"
 
 MAX_RANGE = 45
 FRAME = "world"
+
+print("Using: ", DEVICE)
 
 class CTraversability(Node):
 	def __init__(self):
