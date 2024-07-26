@@ -1,5 +1,6 @@
 import cv2
 import numpy as np
+import ros2_numpy as rnp
 import matplotlib.pyplot as plt
 import math
 from numba import njit, prange
@@ -26,7 +27,7 @@ IN_CHANNELS = 3
 OUT_CHANNELS = 6
 IMAGE_HEIGHT = 360
 IMAGE_WIDTH = 640
-MODEL_PATH = "LRSPP.torch"
+# MODEL_PATH = "LRSPP.torch"
 
 MAX_RANGE = 45
 FRAME = "world"
@@ -51,7 +52,7 @@ class CTraversability(Node):
 			1)
 
 		# Create a synchronizer to sync the RGB, depth images, and point cloud
-		self.ts = ApproximateTimeSynchronizer([self.rgb_sub, self.depth_sub, self.pcl_sub], queue_size=10, slop=0.1)
+		self.ts = ApproximateTimeSynchronizer([self.rgb_sub, self.depth_sub, self.pcl_sub], queue_size=1, slop=0.5)
 		self.ts.registerCallback(self.callback)
 		
 		# Publishers
@@ -80,7 +81,7 @@ class CTraversability(Node):
 		# self.Net.classifier = LRASPPHead(40, 960, OUT_CHANNELS, 128)
 
 		# self.Net.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu'))) # Load trained model
-		self.Net = torch.jit.load('model_lraspp.pt')
+		self.Net = torch.jit.load('./model_lraspp.pt')
 
 		self.Net.to(DEVICE)
 		self.Net.eval() # Set to evaluation mode
@@ -98,9 +99,7 @@ class CTraversability(Node):
 	def callback(self, rgb_msg, depth_msg, pcl_msg):
 		# Convert ROS Image messages to OpenCV images
 		bgr_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
-		depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
-
-		print("New data")
+		depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='32FC1')
 
 		# Calculate the normals of the depth image
 		normals_image, normals_x = self.calculate_normals(depth_image)
@@ -109,16 +108,29 @@ class CTraversability(Node):
 		rgb_image = cv2.cvtColor(bgr_image , cv2.COLOR_BGR2RGB)
 		segmentation_image = self.semantic_segmentation(rgb_image)
 
+		#print("New data")
+
 		# Process the images and point cloudcalculate_normals(self, depth_image)
-		traversability_image = self.compute_traversability(segmentation_image, normals_image, point_cloud)
+		traversability_image = self.compute_traversability(segmentation_image, normals_x)
+		print("Traversability YAY!!!!")
 		
+		# Convert the image back to a ROS Image message
+		normals_msg = self.bridge.cv2_to_imgmsg(normals_image, encoding='rgb8')
+		segmentation_msg = self.bridge.cv2_to_imgmsg(segmentation_image, encoding='mono8')
+		traversability_msg = self.bridge.cv2_to_imgmsg(traversability_image, encoding='mono8')
+		
+		# Publish
+		self.normals_pub.publish(normals_msg)
+		self.segmentation_pub.publish(segmentation_msg)
+		self.traversability_pub.publish(traversability_msg)
+
 		# Convert PointCloud2 to an array
 		point_cloud = self.pointcloud2_to_array(pcl_msg)
 
 		# Cobvert pointcloud to pixels
 		pixels, _ = cv2.projectPoints(point_cloud, self.rvec, self.tvec, self.camera_matrix, self.dist_coeffs)
 
-		depth_ol = cv2.Copy(rgb_image)
+		depth_ol = rgb_image.copy()
 
 		points_trav = []
 
@@ -134,44 +146,38 @@ class CTraversability(Node):
 
 				points_trav.append([point_cloud[idxPixel][0], point_cloud[idxPixel][1], point_cloud[idxPixel][2], traversability_image[int(pixel[0][1]),int(pixel[0][0])]])
 
-		header = Header()
-		header.frame_id = FRAME
-		header.stamp = self.get_clock().now().to_msg()
+		# header = Header()
+		# header.frame_id = FRAME
+		# header.stamp = self.get_clock().now().to_msg()
 
-		fields = [
-			PointField('x', 0, PointField.FLOAT32, 1),
-			PointField('y', 4, PointField.FLOAT32, 1),
-			PointField('z', 8, PointField.FLOAT32, 1),
-			PointField('traversability', 12, PointField.FLOAT32, 1)
-		]
+		# fields = [
+		# 	PointField('x', 0, PointField.FLOAT32, 1),
+		# 	PointField('y', 4, PointField.FLOAT32, 1),
+		# 	PointField('z', 8, PointField.FLOAT32, 1),
+		# 	PointField('traversability', 12, PointField.FLOAT32, 1)
+		# ]
 
 		if len(points_trav) > 0: 
-			point_cloud = pcl2.create_cloud(header, fields, points_trav)
+			# point_cloud = pcl2.create_cloud(header, fields, points_trav)
+			point_cloud = rnp.point_cloud2.array_to_point_cloud2(points_trav, FRAME)
 			self.trav_pcl_pub.publish(point_cloud)
 
 		self.depth_ol_pub.publish(self.bridge.cv2_to_imgmsg(depth_ol, 'bgr8'))
-		
-		# Convert the image back to a ROS Image message
-		normals_msg = self.bridge.cv2_to_imgmsg(normals_image, encoding='rgb8')
-		segmentation_msg = self.bridge.cv2_to_imgmsg(segmentation_image, encoding='mono8')
-		traversability_msg = self.bridge.cv2_to_imgmsg(traversability_image, encoding='mono8')
-		
-		# Publish
-		self.normals_pub.publish(normals_msg)
-		self.segmentation_pub.publish(segmentation_msg)
-		self.traversability_pub.publish(traversability_msg)
 			
 	#@njit(parallel=True)
 	def calculate_normals(self, depth_image):
 		# Convert depth_image to float32 to avoid overflow issues
 		depth_image = depth_image.astype(np.float32)
+		depth_image = cv2.resize(depth_image, (self.width, self.height))
+		#print(depth_image.shape)
 		
-		height, width = depth_image.shape
-		normal_map = np.zeros((height, width, 3), dtype=np.uint8)
-		normal_x_channel = np.zeros((height, width, 1), dtype=np.float32)
+		#height, width = depth_image.shape
+		normal_map = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+		normal_x_channel = np.zeros((self.height, self.width), dtype=np.float32)
 
-		for x in range(1, height - 1):
-			for y in range(1, width - 1):
+		for x in range(1, self.height - 1):
+			for y in range(1, self.width - 1):
+				#print(x, "&", y)
 				dzdx = (depth_image[x + 1, y] - depth_image[x - 1, y]) / 2.0
 				dzdy = (depth_image[x, y + 1] - depth_image[x, y - 1]) / 2.0
 
@@ -193,7 +199,7 @@ class CTraversability(Node):
 
 				# Ensure the normalized_vector does not contain NaN or infinite values
 				if not any(math.isnan(v) or math.isinf(v) for v in normalized_vector):
-					normal_map[x, y] = normalized_vector
+					#normal_map[x, y] = normalized_vector
 					normal_x_channel[x, y] = normalized_vector[0]
 
 		return normal_map, normal_x_channel
@@ -202,6 +208,8 @@ class CTraversability(Node):
 	def compute_traversability(self, segmentation_image, normal_map):
 		# height, width = segmentation_image.shape
 		traversability_map = np.zeros((self.height, self.width), dtype=np.float32)
+		# print(segmentation_image.shape)
+		# print(normal_map.shape)
 		
 		for row in range(self.height):
 			for col in range(self.width):
@@ -220,32 +228,35 @@ class CTraversability(Node):
 		
 	def semantic_segmentation(self, rgb_image):
 		input_tensor = self.transformRGB(rgb_image)
-		input_tensor  = input_tensor .to(DEVICE).unsqueeze(0)
+		input_tensor  = input_tensor.to(DEVICE).unsqueeze(0)
 
 		with torch.no_grad():
 			pred = self.Net(input_tensor)#['out'] # make prediction
 			pred = pred.softmax(dim=1)
 
-		#pred = tf.Resize((self.height, self.width))(pred[0])
-		pred = pred[[0, 5, 4, 3, 2, 1],:,:]
+		# pred = tf.Resize((self.height, self.width))(pred[0])
+		# pred = pred[[0, 5, 4, 3, 2, 1],:,:]
 
-		segmentation_image = torch.argmax(pred, dim=0).cpu().detach().float().numpy() 
+		segmentation_image = torch.argmax(torch.squeeze(pred, 0), dim=0).cpu().detach().float().numpy() 
+		# print(segmentation_image)
 
 		# Resize the image using OpenCV
-		segmentation_image = cv2.resize(segmentation_image, (self.height, self.width))
+		segmentation_image = cv2.resize(segmentation_image, (self.width, self.height))
 		
 		return segmentation_image
 
 	def pointcloud2_to_array(self, point_cloud_msg):
 		# Convert PointCloud2 message to a numpy array
-		point_cloud = []
-		for point in pcl2.read_points(point_cloud_msg, field_names=('x', 'y', 'z'), skip_nans=True):
-			point_cloud.append([point[0], point[1], point[2] if len(point) > 2 else 0])
+		point_cloud = rnp.point_cloud2.point_cloud2_to_array(point_cloud_msg)
+		point_cloud = point_cloud["xyz"]
+		point_cloud = point_cloud[~np.isnan(point_cloud).any(axis=1)]
+		# for point in pcl2.read_points(point_cloud_msg, field_names=('x', 'y', 'z'), skip_nans=True):
+		# 	point_cloud.append([point[0], point[1], point[2] if len(point) > 2 else 0])
 		return np.array(point_cloud)
 	
 	def transformRGB(self, image):
 		# Resize the image using OpenCV
-		image = cv2.resize(image, (IMAGE_WIDTH, IMAGE_HEIGHT))
+		image = cv2.resize(image, (IMAGE_HEIGHT, IMAGE_WIDTH))
 
 		# Convert image to float32 and scale to [0, 1]
 		image = image.astype(np.float32) / 255.0
@@ -261,7 +272,7 @@ class CTraversability(Node):
 		# Convert NumPy array to PyTorch tensor
 		tensor = torch.tensor(image, dtype=torch.float32)
 
-		return tensor
+		return  tensor#.to(DEVICE).unsqueeze(0)
 		
 if __name__ == '__main__':
 	rclpy.init()
