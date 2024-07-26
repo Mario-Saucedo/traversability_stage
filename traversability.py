@@ -41,10 +41,10 @@ class CTraversability(Node):
 		# Create subscribers for RGB, depth images, and point cloud
 		self.rgb_sub = Subscriber(self, Image, '/camera/color/image_raw')
 		self.depth_sub = Subscriber(self, Image, '/camera/aligned_depth_to_color/image_raw')
-		self.pcl_sub = Subscriber(self, PointCloud2, '/ouster/points')
+		self.pcl_sub = Subscriber(self, PointCloud2, '/husky1/ouster/points')
 
 		# Create subscribers for camra info
-		self.subscription = self.create_subscription(
+		self.intrinsics_sub = self.create_subscription(
 			CameraInfo,
 			'/camera/color/camera_info',  # Topic name might vary, adjust as needed
 			self.callback_intrinsics,
@@ -93,17 +93,20 @@ class CTraversability(Node):
 		self.camera_matrix = np.asarray(data.k).reshape((3, 3))
 		self.dist_coeffs = np.asarray(data.d)
 		self.get_logger().info(f"Camera Matrix: {self.camera_matrix}, Dist Coeffs: {self.dist_coeffs}")
-		self.intrinsics_sub.destroy()
+		# self.intrinsics_sub.reset()
 	
 	def callback(self, rgb_msg, depth_msg, pcl_msg):
 		# Convert ROS Image messages to OpenCV images
 		bgr_image = self.bridge.imgmsg_to_cv2(rgb_msg, desired_encoding='bgr8')
 		depth_image = self.bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
 
+		print("New data")
+
 		# Calculate the normals of the depth image
 		normals_image, normals_x = self.calculate_normals(depth_image)
 
 		# Apply semantic segmentation to the image
+		rgb_image = cv2.cvtColor(bgr_image , cv2.COLOR_BGR2RGB)
 		segmentation_image = self.semantic_segmentation(rgb_image)
 
 		# Process the images and point cloudcalculate_normals(self, depth_image)
@@ -115,7 +118,6 @@ class CTraversability(Node):
 		# Cobvert pointcloud to pixels
 		pixels, _ = cv2.projectPoints(point_cloud, self.rvec, self.tvec, self.camera_matrix, self.dist_coeffs)
 
-		rgb_image = cv2.cvtColor(bgr_image , cv2.COLOR_BGR2RGB)
 		depth_ol = cv2.Copy(rgb_image)
 
 		points_trav = []
@@ -159,38 +161,50 @@ class CTraversability(Node):
 		self.segmentation_pub.publish(segmentation_msg)
 		self.traversability_pub.publish(traversability_msg)
 			
-	@njit(parallel=True)
+	#@njit(parallel=True)
 	def calculate_normals(self, depth_image):
+		# Convert depth_image to float32 to avoid overflow issues
+		depth_image = depth_image.astype(np.float32)
+		
 		height, width = depth_image.shape
 		normal_map = np.zeros((height, width, 3), dtype=np.uint8)
 		normal_x_channel = np.zeros((height, width, 1), dtype=np.float32)
 
-		for x in prange(1, height-1):
-			for y in prange(1, width-1):
-				dzdx = (depth_image[x+1, y] - depth_image[x-1, y]) / 2.0
-				dzdy = (depth_image[x, y+1] - depth_image[x, y-1]) / 2.0
+		for x in range(1, height - 1):
+			for y in range(1, width - 1):
+				dzdx = (depth_image[x + 1, y] - depth_image[x - 1, y]) / 2.0
+				dzdy = (depth_image[x, y + 1] - depth_image[x, y - 1]) / 2.0
 
-				if -dzdy < 0:
+				# Handle negative dzdy
+				if dzdy < 0:
 					dzdy = -dzdy
 
 				normal_vector = [-dzdx, -dzdy, 1.0]
-				magnitude = math.sqrt(normal_vector[0]**2 + normal_vector[1]**2 + normal_vector[2]**2)
-				normalized_vector = [255 * normal_vector[0] / magnitude, 
-									255 * normal_vector[1] / magnitude, 
-									255 * normal_vector[2] / magnitude]
+				magnitude = math.sqrt(normal_vector[0] ** 2 + normal_vector[1] ** 2 + normal_vector[2] ** 2)
 
-				normal_map[x, y] = normalized_vector
-				normal_x_channel[x, y] = normalized_vector[0]
+				if magnitude != 0:
+					normalized_vector = [
+						255 * normal_vector[0] / magnitude,
+						255 * normal_vector[1] / magnitude,
+						255 * normal_vector[2] / magnitude
+					]
+				else:
+					normalized_vector = [0, 0, 255]  # Default to a unit vector pointing up
+
+				# Ensure the normalized_vector does not contain NaN or infinite values
+				if not any(math.isnan(v) or math.isinf(v) for v in normalized_vector):
+					normal_map[x, y] = normalized_vector
+					normal_x_channel[x, y] = normalized_vector[0]
 
 		return normal_map, normal_x_channel
 	
-	@njit(parallel=True)
+	#@njit(parallel=True)
 	def compute_traversability(self, segmentation_image, normal_map):
 		# height, width = segmentation_image.shape
 		traversability_map = np.zeros((self.height, self.width), dtype=np.float32)
 		
-		for row in prange(self.height):
-			for col in prange(self.width):
+		for row in range(self.height):
+			for col in range(self.width):
 				normal_value = normal_map[row, col]
 				segment_value = segmentation_image[row, col]
 
