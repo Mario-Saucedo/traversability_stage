@@ -16,9 +16,9 @@ from sensor_msgs.msg import CameraInfo
 from std_msgs.msg import Header
 
 import torch
-import torchvision.transforms as tf
-from torchvision.models.segmentation import lraspp_mobilenet_v3_large
-from torchvision.models.segmentation.lraspp import LRASPPHead
+# import torchvision.transforms as tf
+# from torchvision.models.segmentation import lraspp_mobilenet_v3_large
+# from torchvision.models.segmentation.lraspp import LRASPPHead
 
 #Hyperparameters
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -39,15 +39,15 @@ class CTraversability(Node):
 		self.bridge = CvBridge()
 		
 		# Create subscribers for RGB, depth images, and point cloud
-		self.rgb_sub = Subscriber(self, Image, '/camera/rgb/image_raw')
-		self.depth_sub = Subscriber(self, Image, '/camera/depth/image_raw')
-		self.pcl_sub = Subscriber(self, PointCloud2, '/camera/points')
+		self.rgb_sub = Subscriber(self, Image, '/camera/color/image_raw')
+		self.depth_sub = Subscriber(self, Image, '/camera/aligned_depth_to_color/image_raw')
+		self.pcl_sub = Subscriber(self, PointCloud2, '/ouster/points')
 
 		# Create subscribers for camra info
 		self.subscription = self.create_subscription(
 			CameraInfo,
 			'/camera/color/camera_info',  # Topic name might vary, adjust as needed
-			self.intrinsics_callback,
+			self.callback_intrinsics,
 			1)
 
 		# Create a synchronizer to sync the RGB, depth images, and point cloud
@@ -61,11 +61,11 @@ class CTraversability(Node):
 		self.trav_pcl_pub = self.create_publisher(PointCloud2, "/traversability/points", 1)
 		self.depth_ol_pub = self.create_publisher(Image, "/lidar/aligned_range_to_image/image_raw", 1)
 
-		# #-----------Default intrinsics---------------#
-		# self.height = 720
-		# self.width = 1280
-		# self.camera_matrix = np.asarray([635.2752075195312, 0.0, 652.32861328125, 0.0, 634.6666259765625, 358.4922180175781, 0.0, 0.0, 1.0]).reshape((3, 3))
-		# self.dist_coeffs = np.asarray([-0.05529356002807617, 0.06882049143314362, -0.00044326853821985424, 0.0005935364752076566, -0.021897781640291214])
+		#-----------Default intrinsics---------------#
+		self.height = 720
+		self.width = 1280
+		self.camera_matrix = np.asarray([635.2752075195312, 0.0, 652.32861328125, 0.0, 634.6666259765625, 358.4922180175781, 0.0, 0.0, 1.0]).reshape((3, 3))
+		self.dist_coeffs = np.asarray([-0.05529356002807617, 0.06882049143314362, -0.00044326853821985424, 0.0005935364752076566, -0.021897781640291214])
 		
 		#-------------Default extrinsics----------------#
 		self.tvec = np.asarray([0.10,0.00,-0.10])
@@ -76,16 +76,16 @@ class CTraversability(Node):
 		self.cmaplist = [self.cmap(i) for i in range(self.cmap.N)]
 
 		################## NETWORK #####################
+		# self.Net = lraspp_mobilenet_v3_large()
+		# self.Net.classifier = LRASPPHead(40, 960, OUT_CHANNELS, 128)
 
-		self.transformRGB = tf.Compose([tf.ToPILImage(), tf.Resize((IMAGE_HEIGHT, IMAGE_WIDTH)), tf.ToTensor(), tf.Normalize((0.485, 0.456, 0.406),(0.229, 0.224, 0.225))])  # tf.Resize((300,600)),tf.RandomRotation(145)])#
-
-		self.Net = lraspp_mobilenet_v3_large()
-		self.Net.classifier = LRASPPHead(40, 960, OUT_CHANNELS, 128)
-
-		self.Net.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu'))) # Load trained model
-		self.Net.eval() # Set to evaluation mode
+		# self.Net.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu'))) # Load trained model
+		self.Net = torch.jit.load('model_lraspp.pt')
 
 		self.Net.to(DEVICE)
+		self.Net.eval() # Set to evaluation mode
+
+		print("Network Set")
 
 	def callback_intrinsics(self, data):
 		self.height = data.height
@@ -184,7 +184,7 @@ class CTraversability(Node):
 
 		return normal_map, normal_x_channel
 	
-	@njit(nopython=True, parallel=True)
+	@njit(parallel=True)
 	def compute_traversability(self, segmentation_image, normal_map):
 		# height, width = segmentation_image.shape
 		traversability_map = np.zeros((self.height, self.width), dtype=np.float32)
@@ -209,25 +209,48 @@ class CTraversability(Node):
 		input_tensor  = input_tensor .to(DEVICE).unsqueeze(0)
 
 		with torch.no_grad():
-			pred = self.Net(input_tensor )['out'] # make prediction
+			pred = self.Net(input_tensor)#['out'] # make prediction
 			pred = pred.softmax(dim=1)
 
-		pred = tf.Resize((self.height, self.width))(pred[0])
+		#pred = tf.Resize((self.height, self.width))(pred[0])
 		pred = pred[[0, 5, 4, 3, 2, 1],:,:]
 
 		segmentation_image = torch.argmax(pred, dim=0).cpu().detach().float().numpy() 
+
+		# Resize the image using OpenCV
+		segmentation_image = cv2.resize(segmentation_image, (self.height, self.width))
 		
 		return segmentation_image
 
 	def pointcloud2_to_array(self, point_cloud_msg):
 		# Convert PointCloud2 message to a numpy array
 		point_cloud = []
-		for point in pc2.read_points(point_cloud_msg, field_names=('x', 'y', 'z'), skip_nans=True):
+		for point in pcl2.read_points(point_cloud_msg, field_names=('x', 'y', 'z'), skip_nans=True):
 			point_cloud.append([point[0], point[1], point[2] if len(point) > 2 else 0])
 		return np.array(point_cloud)
 	
+	def transformRGB(self, image):
+		# Resize the image using OpenCV
+		image = cv2.resize(image, (IMAGE_WIDTH, IMAGE_HEIGHT))
+
+		# Convert image to float32 and scale to [0, 1]
+		image = image.astype(np.float32) / 255.0
+
+		# Normalize the image
+		mean = np.array([0.485, 0.456, 0.406])
+		std = np.array([0.229, 0.224, 0.225])
+		image = (image - mean) / std
+
+		# Convert HWC (height, width, channel) to CHW (channel, height, width)
+		image = np.transpose(image, (2, 0, 1))
+
+		# Convert NumPy array to PyTorch tensor
+		tensor = torch.tensor(image, dtype=torch.float32)
+
+		return tensor
+		
 if __name__ == '__main__':
-	rclpy.init('traversability', anonymous=True)
+	rclpy.init()
 	node = CTraversability()
 	try:
 		rclpy.spin(node)
