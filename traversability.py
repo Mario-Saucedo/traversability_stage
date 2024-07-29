@@ -3,17 +3,20 @@ import numpy as np
 import ros2_numpy as rnp
 import matplotlib.pyplot as plt
 import math
-from numba import njit, prange
+# from numba import njit, prange
+import numba
+from numba import cuda
 import torch
+import struct
 
 import rclpy
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
-import sensor_msgs.msg._point_cloud2 as pcl2
-from sensor_msgs.msg import PointCloud2
-from sensor_msgs.msg import PointField
+import sensor_msgs_py.point_cloud2 as pcl2
+from sensor_msgs.msg import PointCloud2, PointField
+# from sensor_msgs.msg import PointField
 from sensor_msgs.msg import CameraInfo
 from std_msgs.msg import Header
 
@@ -29,10 +32,128 @@ IMAGE_HEIGHT = 360
 IMAGE_WIDTH = 640
 # MODEL_PATH = "LRSPP.torch"
 
-MAX_RANGE = 45
+MAX_RANGE = 15
 FRAME = "world"
 
 print("Using: ", DEVICE)
+
+
+
+@cuda.jit
+def calculate_normals_kernel(depth_image, normal_map, normal_x_channel):
+	x, y = cuda.grid(2)
+	height, width = depth_image.shape
+	
+	if 1 <= x < height - 1 and 1 <= y < width - 1:
+		dzdx = (depth_image[x + 1, y] - depth_image[x - 1, y]) / 2.0
+		dzdy = (depth_image[x, y + 1] - depth_image[x, y - 1]) / 2.0
+
+		if dzdy < 0:
+			dzdy = -dzdy
+
+		#normal_vector = [-dzdx, -dzdy, 1.0]
+		magnitude = math.sqrt(-dzdx ** 2 + -dzdy ** 2 + 1.0 ** 2)
+
+		if magnitude != 0:
+			# normalized_vector = [
+			#	 255 * -dzdx / magnitude,
+			#	 255 * -dzdy / magnitude,
+			#	 255 * 1.0 / magnitude
+			# ]
+			# Ensure the normalized_vector does not contain NaN or infinite values
+			#if not (math.isnan(normalized_vector[0]) or math.isinf(normalized_vector[0]) or
+			#		math.isnan(normalized_vector[1]) or math.isinf(normalized_vector[1]) or
+			#		math.isnan(normalized_vector[2]) or math.isinf(normalized_vector[2])):
+			normal_map[x, y, 0] = int(255 * -dzdx / magnitude)
+			normal_map[x, y, 1] = int(255 * -dzdy / magnitude)
+			normal_map[x, y, 2] = int(255 * 1.0 / magnitude)
+			normal_x_channel[x, y] = 255 * -dzdx / magnitude
+		else:
+			normal_map[x, y, 0] = 0
+			normal_map[x, y, 1] = 0
+			normal_map[x, y, 2] = 255
+			normal_x_channel[x, y] = 0
+
+@cuda.jit
+def compute_traversability_kernel(segmentation_image, normal_map, traversability_map):
+	row, col = cuda.grid(2)
+
+	if row < segmentation_image.shape[0] and col < segmentation_image.shape[1]:
+		normal_value = normal_map[row, col]
+		segment_value = segmentation_image[row, col]
+
+		if math.isnan(normal_value) or math.isnan(segment_value) or normal_value == 0 or segment_value <= 1:
+			traversability_map[row, col] = 0
+		elif abs(normal_value) >= 250:
+			traversability_map[row, col] = 51 * segment_value
+		else:
+			threshold_value = -0.039 * abs(normal_value) + 10.0
+			traversability_map[row, col] = 51 * segment_value * math.exp(-threshold_value * 1.5 / (segment_value - 1))
+
+# @cuda.jit
+# def process_pixels_kernel(pixels, point_cloud, traversability_image, rgb_image, depth_ol, tvec, cmaplist, points_xyz, points_trav, points_rgb, num_pixels, width, height):
+# 	idx = cuda.grid(1)
+# 	#height, width = rgb_image.shape
+# 	idx = cuda.grid(1)
+# 	if idx < num_pixels:
+# 		# Access pixel coordinates
+# 		pixel_x = int(pixels[idx, 0])
+# 		pixel_y = int(pixels[idx, 1])
+
+# 		# Ensure coordinates are within bounds and the condition on point_cloud
+# 		if (0 <= pixel_x < width) and (0 <= pixel_y < height) and (point_cloud[idx, 0] > tvec[0]):
+# 			# Calculate depth value
+# 			norm = np.linalg.norm(point_cloud[idx])
+# 			depth = int(norm * 255 / MAX_RANGE)
+# 			depth = min(depth, 255)  # Ensure depth is within [0, 255]
+
+# 			# Get color from cmaplist
+# 			color_range = cmaplist[depth]
+
+# 			# Update depth_ol
+# 			depth_ol[pixel_y, pixel_x, 0] = int(color_range[0] * 255)
+# 			depth_ol[pixel_y, pixel_x, 1] = int(color_range[1] * 255)
+# 			depth_ol[pixel_y, pixel_x, 2] = int(color_range[2] * 255)
+
+# 			# Update points_xyz, points_trav, and points_rgb
+# 			points_xyz[idx, 0] = point_cloud[idx, 0]
+# 			points_xyz[idx, 1] = point_cloud[idx, 1]
+# 			points_xyz[idx, 2] = point_cloud[idx, 2]
+# 			points_trav[idx] = traversability_image[pixel_y, pixel_x]
+# 			points_rgb[idx, 0] = rgb_image[pixel_y, pixel_x, 0]
+# 			points_rgb[idx, 1] = rgb_image[pixel_y, pixel_x, 1]
+# 			points_rgb[idx, 2] = rgb_image[pixel_y, pixel_x, 2]
+
+	# if idx < num_pixels:
+	# 	pixel_x, pixel_y = int(pixels[idx, 0]), int(pixels[idx, 1])
+		
+	# 	if (0 <= pixel_x < width and
+	# 		0 <= pixel_y < height and
+	# 		point_cloud[idx, 0] > tvec[0]):
+
+	# 		# Calculate depth
+	# 		norm = (point_cloud[idx, 0]**2 + point_cloud[idx, 1]**2 + point_cloud[idx, 2]**2) ** 0.5
+	# 		depth = int(norm * 255 / MAX_RANGE)
+	# 		depth = min(depth, 255)
+
+	# 		# Get color from cmaplist
+	# 		color_range = cmaplist[depth]
+	# 		color = (int(color_range[0] * 255), int(color_range[1] * 255), int(color_range[2] * 255))
+
+	# 		# Draw circle on depth_ol
+	# 		if (0 <= pixel_x < depth_ol.shape[1] and 0 <= pixel_y < depth_ol.shape[0]):
+	# 			depth_ol[pixel_y, pixel_x, 0] = color[0]
+	# 			depth_ol[pixel_y, pixel_x, 1] = color[1]
+	# 			depth_ol[pixel_y, pixel_x, 2] = color[2]
+
+	# 		# Collect points
+	# 		points_xyz[idx, 0] = point_cloud[idx, 0]
+	# 		points_xyz[idx, 1] = point_cloud[idx, 1]
+	# 		points_xyz[idx, 2] = point_cloud[idx, 2]
+	# 		points_trav[idx] = traversability_image[pixel_y, pixel_x]
+	# 		points_rgb[idx, 0] = rgb_image[pixel_y, pixel_x, 0]
+	# 		points_rgb[idx, 1] = rgb_image[pixel_y, pixel_x, 1]
+	# 		points_rgb[idx, 2] = rgb_image[pixel_y, pixel_x, 2]
 
 class CTraversability(Node):
 	def __init__(self):
@@ -40,14 +161,14 @@ class CTraversability(Node):
 		self.bridge = CvBridge()
 		
 		# Create subscribers for RGB, depth images, and point cloud
-		self.rgb_sub = Subscriber(self, Image, '/camera/color/image_raw')
-		self.depth_sub = Subscriber(self, Image, '/camera/aligned_depth_to_color/image_raw')
-		self.pcl_sub = Subscriber(self, PointCloud2, '/husky1/ouster/points')
+		self.rgb_sub = Subscriber(self, Image, '/husky1/camera/color/image_raw')
+		self.depth_sub = Subscriber(self, Image, '/husky1/camera/aligned_depth_to_color/image_raw')
+		self.pcl_sub = Subscriber(self, PointCloud2, '/husky1/lidar_points')
 
 		# Create subscribers for camra info
 		self.intrinsics_sub = self.create_subscription(
 			CameraInfo,
-			'/camera/color/camera_info',  # Topic name might vary, adjust as needed
+			'/husky1/camera/color/camera_info',  # Topic name might vary, adjust as needed
 			self.callback_intrinsics,
 			1)
 
@@ -69,7 +190,7 @@ class CTraversability(Node):
 		self.dist_coeffs = np.asarray([-0.05529356002807617, 0.06882049143314362, -0.00044326853821985424, 0.0005935364752076566, -0.021897781640291214])
 		
 		#-------------Default extrinsics----------------#
-		self.tvec = np.asarray([0.10,0.00,-0.10])
+		self.tvec = np.asarray([0.01,-0.06,0.02])
 		self.rvec,_ = cv2.Rodrigues(np.asarray([[0.0,0.0,-1.0],[1.0,0.0,0.0],[0.0,1.0,0.0]]))
 
 		#---------------------Color---------------------#
@@ -103,10 +224,12 @@ class CTraversability(Node):
 
 		# Calculate the normals of the depth image
 		normals_image, normals_x = self.calculate_normals(depth_image)
+		print("Normals...")
 
 		# Apply semantic segmentation to the image
 		rgb_image = cv2.cvtColor(bgr_image , cv2.COLOR_BGR2RGB)
 		segmentation_image = self.semantic_segmentation(rgb_image)
+		print("Segmentation...")
 
 		#print("New data")
 
@@ -116,8 +239,8 @@ class CTraversability(Node):
 		
 		# Convert the image back to a ROS Image message
 		normals_msg = self.bridge.cv2_to_imgmsg(normals_image, encoding='rgb8')
-		segmentation_msg = self.bridge.cv2_to_imgmsg(segmentation_image, encoding='mono8')
-		traversability_msg = self.bridge.cv2_to_imgmsg(traversability_image, encoding='mono8')
+		segmentation_msg = self.bridge.cv2_to_imgmsg(segmentation_image, encoding='32FC1')
+		traversability_msg = self.bridge.cv2_to_imgmsg(traversability_image, encoding='32FC1')
 		
 		# Publish
 		self.normals_pub.publish(normals_msg)
@@ -132,19 +255,52 @@ class CTraversability(Node):
 
 		depth_ol = rgb_image.copy()
 
+		points_xyz = []
 		points_trav = []
+		points_rgb = []
 
+		# Iterate over pixels and process
 		for idxPixel, pixel in enumerate(pixels):
-			if pixel[0][0]<self.width and pixel[0][1]<self.height and pixel[0][0]>=0 and pixel[0][1]>=0 and point_cloud[idxPixel][0]>self.tvec[0]:
-
-				depth = int(np.linalg.norm(point_cloud[idxPixel])*255/MAX_RANGE)
+			# Extract coordinates from pixel
+			px, py = pixel[0]
+			
+			# Safely convert coordinates to integers
+			px = self.safe_convert_to_int(px)
+			py = self.safe_convert_to_int(py)
+			
+			# Check if coordinates are within bounds
+			if px < self.width and py < self.height and px >= 0 and py >= 0 and point_cloud[idxPixel][0] > self.tvec[0]:
+				depth = int(np.linalg.norm(point_cloud[idxPixel]) * 255 / MAX_RANGE)
 				if depth > 255:
 					depth = 255
-
+				
 				color_range = self.cmaplist[depth]
-				depth_ol = cv2.circle(depth_ol, tuple([int(pixel[0][0]), int(pixel[0][1])]), 1, (int(color_range[0]*255), int(color_range[1]*255), int(color_range[2]*255)), -1)
+				depth_ol = cv2.circle(depth_ol, (px, py), 1, (int(color_range[0] * 255), int(color_range[1] * 255), int(color_range[2] * 255)), -1)
+				
+				points_xyz.append([point_cloud[idxPixel][0], point_cloud[idxPixel][1], point_cloud[idxPixel][2]])
+				points_trav.append(traversability_image[py, px])
+				points_rgb.append(rgb_image[py, px])
+				#print(rgb_image[py, px])
 
-				points_trav.append([point_cloud[idxPixel][0], point_cloud[idxPixel][1], point_cloud[idxPixel][2], traversability_image[int(pixel[0][1]),int(pixel[0][0])]])
+		print("Points...")
+
+		# for idxPixel, pixel in enumerate(pixels):
+		# 	if pixel[0][0]<self.width and pixel[0][1]<self.height and pixel[0][0]>=0 and pixel[0][1]>=0 and point_cloud[idxPixel][0]>self.tvec[0]:
+
+		# 		depth = int(np.linalg.norm(point_cloud[idxPixel])*255/MAX_RANGE)
+		# 		if depth > 255:
+		# 			depth = 255
+
+		# 		color_range = self.cmaplist[depth]
+		# 		depth_ol = cv2.circle(depth_ol, tuple([int(pixel[0][0]), int(pixel[0][1])]), 1, (int(color_range[0]*255), int(color_range[1]*255), int(color_range[2]*255)), -1)
+
+		# 		points_xyz.append([point_cloud[idxPixel][0], point_cloud[idxPixel][1], point_cloud[idxPixel][2]])
+		# 		points_trav.append(traversability_image[int(pixel[0][1]),int(pixel[0][0])])
+		# 		points_rgb.append(rgb_image[int(pixel[0][1]),int(pixel[0][0])])
+
+		# depth_ol, points_xyz, points_trav, points_rgb = self.process_pixels(
+		# 	pixels, point_cloud, traversability_image, rgb_image, depth_ol
+		# )
 
 		# header = Header()
 		# header.frame_id = FRAME
@@ -157,72 +313,144 @@ class CTraversability(Node):
 		# 	PointField('traversability', 12, PointField.FLOAT32, 1)
 		# ]
 
-		if len(points_trav) > 0: 
-			# point_cloud = pcl2.create_cloud(header, fields, points_trav)
-			point_cloud = rnp.point_cloud2.array_to_point_cloud2(points_trav, FRAME)
-			self.trav_pcl_pub.publish(point_cloud)
+		#points_dic = {"xyz" : points_xyz, "intesity": points_trav, "rgb" : points_rgb}
 
-		self.depth_ol_pub.publish(self.bridge.cv2_to_imgmsg(depth_ol, 'bgr8'))
+		points_xyz = np.array(points_xyz)
+		points_trav = np.array(points_trav)
+		points_rgb = np.array(points_rgb)
+		# data = np.zeros(len(points_trav), dtype=[
+		# 	('x', np.float32),
+		# 	('y', np.float32),
+		# 	('z', np.float32),
+		# 	('intensity', np.float32),
+		# 	('rgb', np.uint8, (3,))
+		# ])
+
+		# data['x'] = points_xyz[:, 0]
+		# data['y'] = points_xyz[:, 1]
+		# data['z'] = points_xyz[:, 2]
+		# data['intensity'] = points_trav
+		# data['rgb'] = points_rgb
+
+		# if len(points_trav) > 0: 
+		# 	# point_cloud = pcl2.create_cloud(header, fields, points_trav)
+		# 	point_cloud = rnp.point_cloud2.array_to_point_cloud2(data, FRAME)
+		# 	# point_cloud = rnp.msgify(PointCloud2, data)
+		# 	point_cloud.header.frame_id = FRAME
+		# 	self.trav_pcl_pub.publish(point_cloud)
+
+		point_cloud_msg = self.create_point_cloud2(points_xyz, points_trav, points_rgb)
+		self.trav_pcl_pub.publish(point_cloud_msg)
+
+		self.depth_ol_pub.publish(self.bridge.cv2_to_imgmsg(depth_ol, 'rgb8'))
+
+	def safe_convert_to_int(self, value):
+		"""Safely convert a value to an integer, handling infinities and NaNs."""
+		if np.isinf(value) or np.isnan(value):
+			return 0  # Default or fallback value
+		return int(value)
 			
 	#@njit(parallel=True)
+	# @cuda.jit
+	# def calculate_normals(self, depth_image):
+	# 	# Convert depth_image to float32 to avoid overflow issues
+	# 	depth_image = depth_image.astype(np.float32)
+	# 	depth_image = cv2.resize(depth_image, (self.width, self.height))
+	# 	#print(depth_image.shape)
+		
+	# 	#height, width = depth_image.shape
+	# 	normal_map = np.zeros((self.height, self.width, 3), dtype=np.uint8)
+	# 	normal_x_channel = np.zeros((self.height, self.width), dtype=np.float32)
+
+	# 	for x in range(1, self.height - 1):
+	# 		for y in range(1, self.width - 1):
+	# 			#print(x, "&", y)
+	# 			dzdx = (depth_image[x + 1, y] - depth_image[x - 1, y]) / 2.0
+	# 			dzdy = (depth_image[x, y + 1] - depth_image[x, y - 1]) / 2.0
+
+	# 			# Handle negative dzdy
+	# 			if dzdy < 0:
+	# 				dzdy = -dzdy
+
+	# 			normal_vector = [-dzdx, -dzdy, 1.0]
+	# 			magnitude = math.sqrt(normal_vector[0] ** 2 + normal_vector[1] ** 2 + normal_vector[2] ** 2)
+
+	# 			if magnitude != 0:
+	# 				normalized_vector = [
+	# 					255 * normal_vector[0] / magnitude,
+	# 					255 * normal_vector[1] / magnitude,
+	# 					255 * normal_vector[2] / magnitude
+	# 				]
+	# 			else:
+	# 				normalized_vector = [0, 0, 255]  # Default to a unit vector pointing up
+
+	# 			# Ensure the normalized_vector does not contain NaN or infinite values
+	# 			if not any(math.isnan(v) or math.isinf(v) for v in normalized_vector):
+	# 				#normal_map[x, y] = normalized_vector
+	# 				normal_x_channel[x, y] = normalized_vector[0]
+
+	# 	return normal_map, normal_x_channel
+
 	def calculate_normals(self, depth_image):
-		# Convert depth_image to float32 to avoid overflow issues
 		depth_image = depth_image.astype(np.float32)
 		depth_image = cv2.resize(depth_image, (self.width, self.height))
-		#print(depth_image.shape)
-		
-		#height, width = depth_image.shape
+
 		normal_map = np.zeros((self.height, self.width, 3), dtype=np.uint8)
 		normal_x_channel = np.zeros((self.height, self.width), dtype=np.float32)
 
-		for x in range(1, self.height - 1):
-			for y in range(1, self.width - 1):
-				#print(x, "&", y)
-				dzdx = (depth_image[x + 1, y] - depth_image[x - 1, y]) / 2.0
-				dzdy = (depth_image[x, y + 1] - depth_image[x, y - 1]) / 2.0
+		threadsperblock = (16, 16)
+		blockspergrid_x = math.ceil(depth_image.shape[0] / threadsperblock[0])
+		blockspergrid_y = math.ceil(depth_image.shape[1] / threadsperblock[1])
+		blockspergrid = (blockspergrid_x, blockspergrid_y)
 
-				# Handle negative dzdy
-				if dzdy < 0:
-					dzdy = -dzdy
-
-				normal_vector = [-dzdx, -dzdy, 1.0]
-				magnitude = math.sqrt(normal_vector[0] ** 2 + normal_vector[1] ** 2 + normal_vector[2] ** 2)
-
-				if magnitude != 0:
-					normalized_vector = [
-						255 * normal_vector[0] / magnitude,
-						255 * normal_vector[1] / magnitude,
-						255 * normal_vector[2] / magnitude
-					]
-				else:
-					normalized_vector = [0, 0, 255]  # Default to a unit vector pointing up
-
-				# Ensure the normalized_vector does not contain NaN or infinite values
-				if not any(math.isnan(v) or math.isinf(v) for v in normalized_vector):
-					#normal_map[x, y] = normalized_vector
-					normal_x_channel[x, y] = normalized_vector[0]
+		calculate_normals_kernel[blockspergrid, threadsperblock](depth_image, normal_map, normal_x_channel)
 
 		return normal_map, normal_x_channel
-	
-	#@njit(parallel=True)
-	def compute_traversability(self, segmentation_image, normal_map):
-		# height, width = segmentation_image.shape
-		traversability_map = np.zeros((self.height, self.width), dtype=np.float32)
-		# print(segmentation_image.shape)
-		# print(normal_map.shape)
-		
-		for row in range(self.height):
-			for col in range(self.width):
-				normal_value = normal_map[row, col]
-				segment_value = segmentation_image[row, col]
 
-				if np.isnan(normal_value) or np.isnan(segment_value) or normal_value == 0 or segment_value <= 1:
-					traversability_map[row, col] = 0
-				elif abs(normal_value) >= 250:
-					traversability_map[row, col] = 51 * segment_value
-				else:
-					threshold_value = -0.039 * abs(normal_value) + 10.0
-					traversability_map[row, col] = 51 * segment_value * np.exp(-threshold_value * 1.5 / (segment_value - 1))
+	#@njit(parallel=True)
+	# @cuda.jit
+	# def compute_traversability(self, segmentation_image, normal_map):
+	# 	# height, width = segmentation_image.shape
+	# 	traversability_map = np.zeros((self.height, self.width), dtype=np.float32)
+	# 	# print(segmentation_image.shape)
+	# 	# print(normal_map.shape)
+		
+	# 	for row in range(self.height):
+	# 		for col in range(self.width):
+	# 			normal_value = normal_map[row, col]
+	# 			segment_value = segmentation_image[row, col]
+
+	# 			if np.isnan(normal_value) or np.isnan(segment_value) or normal_value == 0 or segment_value <= 1:
+	# 				traversability_map[row, col] = 0
+	# 			elif abs(normal_value) >= 250:
+	# 				traversability_map[row, col] = 51 * segment_value
+	# 			else:
+	# 				threshold_value = -0.039 * abs(normal_value) + 10.0
+	# 				traversability_map[row, col] = 51 * segment_value * np.exp(-threshold_value * 1.5 / (segment_value - 1))
+
+	# 	return traversability_map
+
+	def compute_traversability(self, segmentation_image, normal_map):
+		traversability_map = np.zeros((self.height, self.width), dtype=np.float32)
+
+		# Copy data to the device
+		segmentation_image_device = cuda.to_device(segmentation_image)
+		normal_map_device = cuda.to_device(normal_map)
+		traversability_map_device = cuda.to_device(traversability_map)
+
+		# Define the number of threads in a block and the number of blocks in a grid
+		threadsperblock = (16, 16)
+		blockspergrid_x = int(np.ceil(segmentation_image.shape[0] / threadsperblock[0]))
+		blockspergrid_y = int(np.ceil(segmentation_image.shape[1] / threadsperblock[1]))
+		blockspergrid = (blockspergrid_x, blockspergrid_y)
+
+		# Launch the kernel
+		compute_traversability_kernel[blockspergrid, threadsperblock](
+			segmentation_image_device, normal_map_device, traversability_map_device
+		)
+
+		# Copy the result back to the host
+		traversability_map = traversability_map_device.copy_to_host()
 
 		return traversability_map
 		
@@ -273,6 +501,95 @@ class CTraversability(Node):
 		tensor = torch.tensor(image, dtype=torch.float32)
 
 		return  tensor#.to(DEVICE).unsqueeze(0)
+	
+	def create_point_cloud2(self, points_xyz, points_trav, points_rgb):
+		""" Creates a point cloud message.
+		Args:
+			points: Nx3 array of xyz positions.
+			parent_frame: frame in which the point cloud is defined
+		Returns:
+			sensor_msgs/PointCloud2 message
+
+		Code source:
+			https://gist.github.com/pgorczak/5c717baa44479fa064eb8d33ea4587e0
+
+		References:
+			http://docs.ros.org/melodic/api/sensor_msgs/html/msg/PointCloud2.html
+			http://docs.ros.org/melodic/api/sensor_msgs/html/msg/PointField.html
+			http://docs.ros.org/melodic/api/std_msgs/html/msg/Header.html
+
+		"""
+		# In a PointCloud2 message, the point cloud is stored as an byte 
+		# array. In order to unpack it, we also include some parameters 
+		# which desribes the size of each individual point.
+		ros_dtype = PointField.FLOAT32
+		dtype = np.float32
+		itemsize = np.dtype(dtype).itemsize # A 32-bit float takes 4 bytes.
+
+		# Add a new axis to points_trav to match the dimensions for concatenation
+		points_trav = points_trav[:, np.newaxis]  # Shape will be (number_of_points, 1)
+
+		# Concatenate points_xyz and points_trav along the last axis
+		points = np.hstack((points_xyz, points_trav))
+		#points = np.concatenate((points_xyz, points_trav), axis=0)
+
+		data = points.astype(dtype).tobytes() 
+
+		# The fields specify what the bytes represents. The first 4 bytes 
+		# represents the x-coordinate, the next 4 the y-coordinate, etc.
+		fields = [PointField(
+			name=n, offset=i*itemsize, datatype=ros_dtype, count=1)
+			for i, n in enumerate('xyzt')]
+
+		# The PointCloud2 message also has a header which specifies which 
+		# coordinate frame it is represented in. 
+		header = Header(frame_id=FRAME)
+
+		return PointCloud2(
+			header=header,
+			height=1, 
+			width=points.shape[0],
+			is_dense=False,
+			is_bigendian=False,
+			fields=fields,
+			point_step=(itemsize * 4), # Every point consists of three float32s.
+			row_step=(itemsize * 4 * points.shape[0]),
+			data=data
+		)
+				
+	# def process_pixels(self, pixels, point_cloud, traversability_image, rgb_image, depth_ol):
+	# 	num_pixels = pixels.shape[0]
+
+	# 	# Prepare the data for GPU processing
+	# 	d_pixels = cuda.to_device(pixels)
+	# 	d_point_cloud = cuda.to_device(point_cloud)
+	# 	d_traversability_image = cuda.to_device(traversability_image)
+	# 	d_rgb_image = cuda.to_device(rgb_image)
+	# 	d_depth_ol = cuda.to_device(depth_ol)
+	# 	d_tvec = cuda.to_device(self.tvec)
+	# 	d_cmaplist = cuda.to_device(self.cmaplist)
+
+	# 	# Allocate arrays on device for points_xyz, points_trav, and points_rgb
+	# 	d_points_xyz = cuda.device_array((num_pixels, 3), dtype=np.float32)
+	# 	d_points_trav = cuda.device_array(num_pixels, dtype=np.float32)
+	# 	d_points_rgb = cuda.device_array((num_pixels, 3), dtype=np.uint8)
+
+	# 	# Define CUDA grid and block dimensions
+	# 	threads_per_block = 256
+	# 	blocks_per_grid = (num_pixels + (threads_per_block - 1)) // threads_per_block
+
+	# 	# Launch the CUDA kernel
+	# 	process_pixels_kernel[blocks_per_grid, threads_per_block](
+	# 		d_pixels, d_point_cloud, d_traversability_image, d_rgb_image, d_depth_ol, d_tvec, d_cmaplist, d_points_xyz, d_points_trav, d_points_rgb, num_pixels, self.width, self.height
+	# 	)
+
+	# 	# Copy the results back to host
+	# 	depth_ol = d_depth_ol.copy_to_host()
+	# 	points_xyz = d_points_xyz.copy_to_host()
+	# 	points_trav = d_points_trav.copy_to_host()
+	# 	points_rgb = d_points_rgb.copy_to_host()
+
+	# 	return depth_ol, points_xyz, points_trav, points_rgb
 		
 if __name__ == '__main__':
 	rclpy.init()
