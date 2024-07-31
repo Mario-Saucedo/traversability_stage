@@ -98,7 +98,7 @@ class CTraversability(Node):
 			1)
 
 		# Create a synchronizer to sync the RGB, depth images, and point cloud
-		self.ts = ApproximateTimeSynchronizer([self.rgb_sub, self.depth_sub, self.pcl_sub], queue_size=1, slop=0.2)
+		self.ts = ApproximateTimeSynchronizer([self.rgb_sub, self.depth_sub, self.pcl_sub], queue_size=1, slop=0.25)
 		self.ts.registerCallback(self.callback)
 		
 		# Publishers
@@ -160,6 +160,8 @@ class CTraversability(Node):
 
 		# Process the images and point cloudcalculate_normals(self, depth_image)
 		traversability_image = self.compute_traversability(segmentation_image, normals_x)
+		dilation_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+		traversability_image = cv2.dilate(traversability_image, dilation_kernel, iterations=5)
 		print("Traversability YAY!!!!")
 		
 		# Convert the image back to a ROS Image message
@@ -430,12 +432,10 @@ class CTraversability(Node):
 	
 	def create_point_cloud2(self, points_xyz, points_trav, points_rgb):
 
-		# In a PointCloud2 message, the point cloud is stored as an byte 
-		# array. In order to unpack it, we also include some parameters 
-		# which desribes the size of each individual point.
+		# Define data type for ROS PointCloud2
 		ros_dtype = PointField.FLOAT32
 		dtype = np.float32
-		itemsize = np.dtype(dtype).itemsize # A 32-bit float takes 4 bytes.
+		itemsize = np.dtype(dtype).itemsize  # A 32-bit float takes 4 bytes
 
 		# Add a new axis to points_trav to match the dimensions for concatenation
 		points_trav = points_trav[:, np.newaxis]  # Shape will be (number_of_points, 1)
@@ -448,11 +448,6 @@ class CTraversability(Node):
 
 		# Concatenate points_xyz, points_trav, and points_rgb along the last axis
 		points = np.hstack((points_xyz, points_trav, points_rgb_uint32))
-
-		# Define data type for ROS PointCloud2
-		ros_dtype = PointField.FLOAT32
-		dtype = np.float32
-		itemsize = np.dtype(dtype).itemsize  # A 32-bit float takes 4 bytes
 
 		# Convert data to bytes
 		data = points.astype(dtype).tobytes()
