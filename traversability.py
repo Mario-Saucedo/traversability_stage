@@ -3,11 +3,8 @@ import numpy as np
 import ros2_numpy as rnp
 import matplotlib.pyplot as plt
 import math
-# from numba import njit, prange
-import numba
 from numba import cuda
 import torch
-import struct
 
 import rclpy
 from rclpy.node import Node
@@ -16,7 +13,6 @@ from cv_bridge import CvBridge
 from message_filters import ApproximateTimeSynchronizer, Subscriber
 import sensor_msgs_py.point_cloud2 as pcl2
 from sensor_msgs.msg import PointCloud2, PointField
-# from sensor_msgs.msg import PointField
 from sensor_msgs.msg import CameraInfo
 from std_msgs.msg import Header
 
@@ -26,11 +22,11 @@ from std_msgs.msg import Header
 
 #Hyperparameters
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
-IN_CHANNELS = 3
-OUT_CHANNELS = 6
+# IN_CHANNELS = 3
+# OUT_CHANNELS = 6
 IMAGE_HEIGHT = 360
 IMAGE_WIDTH = 640
-# MODEL_PATH = "LRSPP.torch"
+MODEL_PATH = './model_lraspp.pt'
 
 MAX_RANGE = 15
 FRAME = "world"
@@ -39,46 +35,46 @@ print("Using: ", DEVICE)
 
 @cuda.jit
 def calculate_normals_kernel(depth_image, normal_map, normal_x_channel):
-    x, y = cuda.grid(2)
-    height, width = depth_image.shape
-    
-    if 1 <= x < height - 1 and 1 <= y < width - 1:
-        dzdx = (depth_image[x + 1, y] - depth_image[x - 1, y]) / 2.0
-        dzdy = (depth_image[x, y + 1] - depth_image[x, y - 1]) / 2.0
+	x, y = cuda.grid(2)
+	height, width = depth_image.shape
+	
+	if 1 <= x < height - 1 and 1 <= y < width - 1:
+		dzdx = (depth_image[x + 1, y] - depth_image[x - 1, y]) / 2.0
+		dzdy = (depth_image[x, y + 1] - depth_image[x, y - 1]) / 2.0
 
-        if dzdy < 0:
-            dzdy = -dzdy
+		if dzdy < 0:
+			dzdy = -dzdy
 
-        magnitude = math.sqrt(dzdx ** 2 + dzdy ** 2 + 1.0 ** 2)
+		magnitude = math.sqrt(dzdx ** 2 + dzdy ** 2 + 1.0 ** 2)
 
-        if magnitude != 0:
-            normal_map[x, y, 0] = int(255 * dzdx / magnitude)
-            normal_map[x, y, 1] = int(255 * dzdy / magnitude)
-            normal_map[x, y, 2] = int(255 * 1.0 / magnitude)
-            normal_x_channel[x, y] = 255 * dzdx / magnitude
-        else:
-            normal_map[x, y, 0] = 0
-            normal_map[x, y, 1] = 0
-            normal_map[x, y, 2] = 255
-            normal_x_channel[x, y] = 0
+		if magnitude != 0:
+			normal_map[x, y, 0] = int(255 * dzdx / magnitude)
+			normal_map[x, y, 1] = int(255 * dzdy / magnitude)
+			normal_map[x, y, 2] = int(255 * 1.0 / magnitude)
+			normal_x_channel[x, y] = 255 * dzdx / magnitude
+		else:
+			normal_map[x, y, 0] = 0
+			normal_map[x, y, 1] = 0
+			normal_map[x, y, 2] = 255
+			normal_x_channel[x, y] = 0
 			
 @cuda.jit
 def compute_traversability_kernel(segmentation_image, normal_map, traversability_map):
-    row, col = cuda.grid(2)
+	row, col = cuda.grid(2)
 
-    if row < segmentation_image.shape[0] and col < segmentation_image.shape[1]:
-        normal_value = normal_map[row, col]
-        segment_value = segmentation_image[row, col]
+	if row < segmentation_image.shape[0] and col < segmentation_image.shape[1]:
+		normal_value = normal_map[row, col]
+		segment_value = segmentation_image[row, col]
 
-        if math.isnan(normal_value) or math.isnan(segment_value) or normal_value == 0 or segment_value <= 1:
-            traversability_map[row, col] = 0
-        elif abs(normal_value) >= 250:
-            traversability_map[row, col] = 51 * segment_value
-        else:
-            seg_value = segment_value / 51.0 - 1.0
-            exp_part = math.exp(-(10.0 - 10.0 * normal_value) * 4.0 / seg_value)
-            traversability_value = 255.0 * (seg_value / 4.0) * exp_part
-            traversability_map[row, col] = min(max(int(traversability_value), 0), 255)
+		if math.isnan(normal_value) or math.isnan(segment_value) or normal_value == 0 or segment_value <= 1:
+			traversability_map[row, col] = 0
+		elif abs(normal_value) >= 250:
+			traversability_map[row, col] = 51 * segment_value
+		else:
+			seg_value = segment_value / 51.0 - 1.0
+			exp_part = math.exp(-(10.0 - 10.0 * normal_value) * 4.0 / seg_value)
+			traversability_value = 255.0 * (seg_value / 4.0) * exp_part
+			traversability_map[row, col] = min(max(int(traversability_value), 0), 255)
 
 class CTraversability(Node):
 	def __init__(self):
@@ -127,7 +123,7 @@ class CTraversability(Node):
 		# self.Net.classifier = LRASPPHead(40, 960, OUT_CHANNELS, 128)
 
 		# self.Net.load_state_dict(torch.load(MODEL_PATH, map_location=torch.device('cpu'))) # Load trained model
-		self.Net = torch.jit.load('./model_lraspp.pt')
+		self.Net = torch.jit.load(MODEL_PATH)
 
 		self.Net.to(DEVICE)
 		self.Net.eval() # Set to evaluation mode
@@ -160,7 +156,7 @@ class CTraversability(Node):
 
 		# Process the images and point cloudcalculate_normals(self, depth_image)
 		traversability_image = self.compute_traversability(segmentation_image, normals_x)
-		dilation_kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (3,3))
+		dilation_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
 		traversability_image = cv2.dilate(traversability_image, dilation_kernel, iterations=5)
 		print("Traversability YAY!!!!")
 		
@@ -202,7 +198,7 @@ class CTraversability(Node):
 					depth = 255
 				
 				color_range = self.cmaplist[depth]
-				depth_ol = cv2.circle(depth_ol, (px, py), 1, (int(color_range[0] * 255), int(color_range[1] * 255), int(color_range[2] * 255)), -1)
+				depth_ol = cv2.circle(depth_ol, (px, py), 2, (int(color_range[0] * 255), int(color_range[1] * 255), int(color_range[2] * 255)), -1)
 				
 				points_xyz.append([point_cloud[idxPixel][0], point_cloud[idxPixel][1], point_cloud[idxPixel][2]])
 				points_trav.append(traversability_image[py, px])
@@ -432,49 +428,76 @@ class CTraversability(Node):
 	
 	def create_point_cloud2(self, points_xyz, points_trav, points_rgb):
 
-		# Define data type for ROS PointCloud2
-		ros_dtype = PointField.FLOAT32
-		dtype = np.float32
-		itemsize = np.dtype(dtype).itemsize  # A 32-bit float takes 4 bytes
+		# # Define data type for ROS PointCloud2
+		# ros_dtype = PointField.FLOAT32
+		# dtype = np.float32
+		# itemsize = np.dtype(dtype).itemsize  # A 32-bit float takes 4 bytes
 
 		# Add a new axis to points_trav to match the dimensions for concatenation
-		points_trav = points_trav[:, np.newaxis]  # Shape will be (number_of_points, 1)
+		# points_trav = points_trav[:, np.newaxis]  # Shape will be (number_of_points, 1)
 
 		# Convert points_rgb to a single uint32 value per point
 		points_rgb_uint32 = np.left_shift(points_rgb[:, 0].astype(np.uint32), 16) + \
 							np.left_shift(points_rgb[:, 1].astype(np.uint32), 8) + \
 							points_rgb[:, 2].astype(np.uint32)
-		points_rgb_uint32 = points_rgb_uint32[:, np.newaxis]  # Shape will be (number_of_points, 1)
+		# points_rgb_uint32 = points_rgb_uint32[:, np.newaxis]  # Shape will be (number_of_points, 1)
 
-		# Concatenate points_xyz, points_trav, and points_rgb along the last axis
-		points = np.hstack((points_xyz, points_trav, points_rgb_uint32))
+		# # Concatenate points_xyz, points_trav, and points_rgb along the last axis
+		# points = np.hstack((points_xyz.astype(dtype), points_trav.astype(dtype), points_rgb_uint32))
+
+		# Define a structured numpy dtype
+		dtype = np.dtype([
+			('x', np.float32),
+			('y', np.float32),
+			('z', np.float32),
+			('intensity', np.float32),
+			('rgb', np.uint32)
+		])
+
+		# Create a structured array
+		points_structured = np.zeros(points_xyz.shape[0], dtype=dtype)
+		points_structured['x'] = points_xyz[:, 0]
+		points_structured['y'] = points_xyz[:, 1]
+		points_structured['z'] = points_xyz[:, 2]
+		points_structured['intensity'] = points_trav
+		points_structured['rgb'] = points_rgb_uint32
 
 		# Convert data to bytes
-		data = points.astype(dtype).tobytes()
+		# data = points.tobytes()#.astype(dtype)
+		# # Convert the structured array to bytes
+		data = points_structured.tobytes()
 
-		# Define the fields for the PointCloud2 message
+		# # Calculate expected size
+		# point_step = itemsize * 5  # 5 fields: 3 float32 + 1 float32 + 1 uint32
+		# expected_size = points.shape[0] * point_step
+		# actual_size = len(data)
+
+		# # Debug: Print expected and actual data sizes
+		# print(f"Point step size: {point_step}")
+		# print(f"Expected data size: {expected_size}, Actual data size: {actual_size}")
+
+		# assert actual_size == expected_size, "Data size mismatch!"
+
+		# Define PointCloud2 fields
 		fields = [
-			PointField(name='x', offset=0 * itemsize, datatype=ros_dtype, count=1),
-			PointField(name='y', offset=1 * itemsize, datatype=ros_dtype, count=1),
-			PointField(name='z', offset=2 * itemsize, datatype=ros_dtype, count=1),
-			PointField(name='traversability', offset=3 * itemsize, datatype=ros_dtype, count=1),
-			PointField(name='rgb', offset=4 * itemsize, datatype=PointField.UINT32, count=1)
+			PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+			PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+			PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+			PointField(name='traversability', offset=12, datatype=PointField.FLOAT32, count=1),
+			PointField(name='rgb', offset=16, datatype=PointField.UINT32, count=1)
 		]
 
-		# The PointCloud2 message also has a header which specifies which 
-		# coordinate frame it is represented in.
 		header = Header(frame_id=FRAME)
 
-		# Create and return the PointCloud2 message
 		return PointCloud2(
 			header=header,
 			height=1,
-			width=points.shape[0],
+			width=points_structured.shape[0],
 			is_dense=False,
 			is_bigendian=False,
 			fields=fields,
-			point_step=(itemsize * 5),  # Every point consists of four float32s and one uint32.
-			row_step=(itemsize * 5 * points.shape[0]),
+			point_step=points_structured.itemsize,
+			row_step=(points_structured.itemsize * points_structured.shape[0]),
 			data=data
 		)
 		
