@@ -173,97 +173,7 @@ class CTraversability(Node):
 		# Convert PointCloud2 to an array
 		point_cloud = self.pointcloud2_to_array(pcl_msg)
 
-		# Cobvert pointcloud to pixels
-		pixels, _ = cv2.projectPoints(point_cloud, self.rvec, self.tvec, self.camera_matrix, self.dist_coeffs)
-
-		depth_ol = rgb_image.copy()
-
-		points_xyz = []
-		points_trav = []
-		points_rgb = []
-
-		# Iterate over pixels and process
-		for idxPixel, pixel in enumerate(pixels):
-			# Extract coordinates from pixel
-			px, py = pixel[0]
-			
-			# Safely convert coordinates to integers
-			px = self.safe_convert_to_int(px)
-			py = self.safe_convert_to_int(py)
-			
-			# Check if coordinates are within bounds
-			if px < self.width and py < self.height and px >= 0 and py >= 0 and point_cloud[idxPixel][0] > self.tvec[0]:
-				depth = int(np.linalg.norm(point_cloud[idxPixel]) * 255 / MAX_RANGE)
-				if depth > 255:
-					depth = 255
-				
-				color_range = self.cmaplist[depth]
-				depth_ol = cv2.circle(depth_ol, (px, py), 2, (int(color_range[0] * 255), int(color_range[1] * 255), int(color_range[2] * 255)), -1)
-				
-				points_xyz.append([point_cloud[idxPixel][0], point_cloud[idxPixel][1], point_cloud[idxPixel][2]])
-				points_trav.append(traversability_image[py, px])
-				points_rgb.append(rgb_image[py, px])
-				#print(rgb_image[py, px])
-
-		print("Points...")
-
-		# for idxPixel, pixel in enumerate(pixels):
-		# 	if pixel[0][0]<self.width and pixel[0][1]<self.height and pixel[0][0]>=0 and pixel[0][1]>=0 and point_cloud[idxPixel][0]>self.tvec[0]:
-
-		# 		depth = int(np.linalg.norm(point_cloud[idxPixel])*255/MAX_RANGE)
-		# 		if depth > 255:
-		# 			depth = 255
-
-		# 		color_range = self.cmaplist[depth]
-		# 		depth_ol = cv2.circle(depth_ol, tuple([int(pixel[0][0]), int(pixel[0][1])]), 1, (int(color_range[0]*255), int(color_range[1]*255), int(color_range[2]*255)), -1)
-
-		# 		points_xyz.append([point_cloud[idxPixel][0], point_cloud[idxPixel][1], point_cloud[idxPixel][2]])
-		# 		points_trav.append(traversability_image[int(pixel[0][1]),int(pixel[0][0])])
-		# 		points_rgb.append(rgb_image[int(pixel[0][1]),int(pixel[0][0])])
-
-		# depth_ol, points_xyz, points_trav, points_rgb = self.process_pixels(
-		# 	pixels, point_cloud, traversability_image, rgb_image, depth_ol
-		# )
-
-		# header = Header()
-		# header.frame_id = FRAME
-		# header.stamp = self.get_clock().now().to_msg()
-
-		# fields = [
-		# 	PointField('x', 0, PointField.FLOAT32, 1),
-		# 	PointField('y', 4, PointField.FLOAT32, 1),
-		# 	PointField('z', 8, PointField.FLOAT32, 1),
-		# 	PointField('traversability', 12, PointField.FLOAT32, 1)
-		# ]
-
-		#points_dic = {"xyz" : points_xyz, "intesity": points_trav, "rgb" : points_rgb}
-
-		# data = np.zeros(len(points_trav), dtype=[
-		# 	('x', np.float32),
-		# 	('y', np.float32),
-		# 	('z', np.float32),
-		# 	('intensity', np.float32),
-		# 	('rgb', np.uint8, (3,))
-		# ])
-
-		# data['x'] = points_xyz[:, 0]
-		# data['y'] = points_xyz[:, 1]
-		# data['z'] = points_xyz[:, 2]
-		# data['intensity'] = points_trav
-		# data['rgb'] = points_rgb
-
-		# if len(points_trav) > 0: 
-		# 	# point_cloud = pcl2.create_cloud(header, fields, points_trav)
-		# 	point_cloud = rnp.point_cloud2.array_to_point_cloud2(data, FRAME)
-		# 	# point_cloud = rnp.msgify(PointCloud2, data)
-		# 	point_cloud.header.frame_id = FRAME
-		# 	self.trav_pcl_pub.publish(point_cloud)
-
-		points_xyz = np.array(points_xyz)
-		points_trav = np.array(points_trav)
-		points_rgb = np.array(points_rgb)
-
-		point_cloud_msg = self.create_point_cloud2(points_xyz, points_trav, points_rgb)
+		point_cloud_msg, depth_ol = self.create_point_cloud2(rgb_image, traversability_image, point_cloud)
 		self.trav_pcl_pub.publish(point_cloud_msg)
 
 		self.depth_ol_pub.publish(self.bridge.cv2_to_imgmsg(depth_ol, 'rgb8'))
@@ -426,7 +336,45 @@ class CTraversability(Node):
 
 		return  tensor#.to(DEVICE).unsqueeze(0)
 	
-	def create_point_cloud2(self, points_xyz, points_trav, points_rgb):
+	def create_point_cloud2(self, rgb_image, traversability_image, point_cloud):
+
+		# Cobvert pointcloud to pixels
+		pixels, _ = cv2.projectPoints(point_cloud, self.rvec, self.tvec, self.camera_matrix, self.dist_coeffs)
+
+		depth_ol = rgb_image.copy()
+
+		points_xyz = []
+		points_trav = []
+		points_rgb = []
+
+		# Iterate over pixels and process
+		for idxPixel, pixel in enumerate(pixels):
+			# Extract coordinates from pixel
+			px, py = pixel[0]
+			
+			# Safely convert coordinates to integers
+			px = self.safe_convert_to_int(px)
+			py = self.safe_convert_to_int(py)
+			
+			# Check if coordinates are within bounds
+			if px < self.width and py < self.height and px >= 0 and py >= 0 and point_cloud[idxPixel][0] > self.tvec[0]:
+				depth = int(np.linalg.norm(point_cloud[idxPixel]) * 255 / MAX_RANGE)
+				if depth > 255:
+					depth = 255
+				
+				color_range = self.cmaplist[depth]
+				depth_ol = cv2.circle(depth_ol, (px, py), 2, (int(color_range[0] * 255), int(color_range[1] * 255), int(color_range[2] * 255)), -1)
+				
+				points_xyz.append([point_cloud[idxPixel][0], point_cloud[idxPixel][1], point_cloud[idxPixel][2]])
+				points_trav.append(traversability_image[py, px])
+				points_rgb.append(rgb_image[py, px])
+				#print(rgb_image[py, px])
+
+		# print("Points...")
+
+		points_xyz = np.array(points_xyz)
+		points_trav = np.array(points_trav)
+		points_rgb = np.array(points_rgb)
 
 		# # Define data type for ROS PointCloud2
 		# ros_dtype = PointField.FLOAT32
@@ -467,17 +415,6 @@ class CTraversability(Node):
 		# # Convert the structured array to bytes
 		data = points_structured.tobytes()
 
-		# # Calculate expected size
-		# point_step = itemsize * 5  # 5 fields: 3 float32 + 1 float32 + 1 uint32
-		# expected_size = points.shape[0] * point_step
-		# actual_size = len(data)
-
-		# # Debug: Print expected and actual data sizes
-		# print(f"Point step size: {point_step}")
-		# print(f"Expected data size: {expected_size}, Actual data size: {actual_size}")
-
-		# assert actual_size == expected_size, "Data size mismatch!"
-
 		# Define PointCloud2 fields
 		fields = [
 			PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
@@ -499,7 +436,7 @@ class CTraversability(Node):
 			point_step=points_structured.itemsize,
 			row_step=(points_structured.itemsize * points_structured.shape[0]),
 			data=data
-		)
+		), depth_ol
 		
 if __name__ == '__main__':
 	rclpy.init()
