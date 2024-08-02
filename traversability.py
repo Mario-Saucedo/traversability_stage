@@ -131,7 +131,7 @@ class CTraversability(Node):
 		self.traversability_pub = self.create_publisher(Image, '/traversability/image_raw', 1)
 		self.segmentation_pub = self.create_publisher(Image, '/traversability/segmentation/image_raw', 1)
 		self.normals_pub = self.create_publisher(Image, '/traversability/surface_nromals/image_raw', 1)
-		self.trav_pcl_pub = self.create_publisher(PointCloud2, "/husky1/traversability/points", 1)
+		self.trav_pcl_pub = self.create_publisher(PointCloud2, "/traversability/points", 1)
 		self.depth_ol_pub = self.create_publisher(Image, "/lidar/aligned_range_to_image/image_raw", 1)
 
 		#-----------Default intrinsics---------------#
