@@ -29,7 +29,7 @@ IMAGE_WIDTH = 640
 MODEL_PATH = './model_lraspp.pt'
 
 MAX_RANGE = 15
-FRAME = "world"
+FRAME = "hesai_lidar"
 
 print("Using: ", DEVICE)
 
@@ -76,6 +76,36 @@ def compute_traversability_kernel(segmentation_image, normal_map, traversability
 			traversability_value = 255.0 * (seg_value / 4.0) * exp_part
 			traversability_map[row, col] = min(max(int(traversability_value), 0), 255)
 
+@cuda.jit
+def process_pixels(pixels, point_cloud, traversability_image, rgb_image, structured_points):
+	idx = cuda.grid(1)
+	height, width = traversability_image.shape
+	
+	if idx < len(pixels):
+		# Extract pixel coordinates from the projected points
+		px, py = pixels[idx][0]
+
+		# Safely convert coordinates to integers
+		px = int(px)
+		py = int(py)
+
+		# Check if coordinates are within bounds
+		if 0 <= px < width and 0 <= py < height:# and point_cloud[idx][0] > tvec[0]:
+			# # Calculate depth
+			# depth = int(np.linalg.norm(point_cloud[idx]) * 255 / max_range)
+			# if depth > 255:
+			# 	depth = 255
+
+			# Assign the computed values directly to the structured array
+			structured_points[idx]['x'] = point_cloud[idx][0]
+			structured_points[idx]['y'] = point_cloud[idx][1]
+			structured_points[idx]['z'] = point_cloud[idx][2]
+			structured_points[idx]['intensity'] = traversability_image[py, px]
+			r = rgb_image[py, px, 0]
+			g = rgb_image[py, px, 1]
+			b = rgb_image[py, px, 2]
+			structured_points[idx]['rgb'] = (r << 16) | (g << 8) | b
+
 class CTraversability(Node):
 	def __init__(self):
 		super().__init__('c_traversability')
@@ -101,7 +131,7 @@ class CTraversability(Node):
 		self.traversability_pub = self.create_publisher(Image, '/traversability/image_raw', 1)
 		self.segmentation_pub = self.create_publisher(Image, '/traversability/segmentation/image_raw', 1)
 		self.normals_pub = self.create_publisher(Image, '/traversability/surface_nromals/image_raw', 1)
-		self.trav_pcl_pub = self.create_publisher(PointCloud2, "/traversability/points", 1)
+		self.trav_pcl_pub = self.create_publisher(PointCloud2, "/husky1/traversability/points", 1)
 		self.depth_ol_pub = self.create_publisher(Image, "/lidar/aligned_range_to_image/image_raw", 1)
 
 		#-----------Default intrinsics---------------#
@@ -173,10 +203,10 @@ class CTraversability(Node):
 		# Convert PointCloud2 to an array
 		point_cloud = self.pointcloud2_to_array(pcl_msg)
 
-		point_cloud_msg, depth_ol = self.create_point_cloud2(rgb_image, traversability_image, point_cloud)
+		point_cloud_msg = self.create_point_cloud2(rgb_image, traversability_image, point_cloud)
 		self.trav_pcl_pub.publish(point_cloud_msg)
 
-		self.depth_ol_pub.publish(self.bridge.cv2_to_imgmsg(depth_ol, 'rgb8'))
+		#self.depth_ol_pub.publish(self.bridge.cv2_to_imgmsg(depth_ol, 'rgb8'))
 
 	def safe_convert_to_int(self, value):
 		"""Safely convert a value to an integer, handling infinities and NaNs."""
@@ -335,64 +365,13 @@ class CTraversability(Node):
 		tensor = torch.tensor(image, dtype=torch.float32)
 
 		return  tensor#.to(DEVICE).unsqueeze(0)
-	
-	def create_point_cloud2(self, rgb_image, traversability_image, point_cloud):
 
-		# Cobvert pointcloud to pixels
+	def create_point_cloud2(self, rgb_image, traversability_image, point_cloud):
+		# Project the points to image plane
 		pixels, _ = cv2.projectPoints(point_cloud, self.rvec, self.tvec, self.camera_matrix, self.dist_coeffs)
 
-		depth_ol = rgb_image.copy()
-
-		points_xyz = []
-		points_trav = []
-		points_rgb = []
-
-		# Iterate over pixels and process
-		for idxPixel, pixel in enumerate(pixels):
-			# Extract coordinates from pixel
-			px, py = pixel[0]
-			
-			# Safely convert coordinates to integers
-			px = self.safe_convert_to_int(px)
-			py = self.safe_convert_to_int(py)
-			
-			# Check if coordinates are within bounds
-			if px < self.width and py < self.height and px >= 0 and py >= 0 and point_cloud[idxPixel][0] > self.tvec[0]:
-				depth = int(np.linalg.norm(point_cloud[idxPixel]) * 255 / MAX_RANGE)
-				if depth > 255:
-					depth = 255
-				
-				color_range = self.cmaplist[depth]
-				depth_ol = cv2.circle(depth_ol, (px, py), 2, (int(color_range[0] * 255), int(color_range[1] * 255), int(color_range[2] * 255)), -1)
-				
-				points_xyz.append([point_cloud[idxPixel][0], point_cloud[idxPixel][1], point_cloud[idxPixel][2]])
-				points_trav.append(traversability_image[py, px])
-				points_rgb.append(rgb_image[py, px])
-				#print(rgb_image[py, px])
-
-		# print("Points...")
-
-		points_xyz = np.array(points_xyz)
-		points_trav = np.array(points_trav)
-		points_rgb = np.array(points_rgb)
-
-		# # Define data type for ROS PointCloud2
-		# ros_dtype = PointField.FLOAT32
-		# dtype = np.float32
-		# itemsize = np.dtype(dtype).itemsize  # A 32-bit float takes 4 bytes
-
-		# Add a new axis to points_trav to match the dimensions for concatenation
-		# points_trav = points_trav[:, np.newaxis]  # Shape will be (number_of_points, 1)
-
-		# Convert points_rgb to a single uint32 value per point
-		points_rgb_uint32 = np.left_shift(points_rgb[:, 0].astype(np.uint32), 16) + \
-							np.left_shift(points_rgb[:, 1].astype(np.uint32), 8) + \
-							points_rgb[:, 2].astype(np.uint32)
-		# points_rgb_uint32 = points_rgb_uint32[:, np.newaxis]  # Shape will be (number_of_points, 1)
-
-		# # Concatenate points_xyz, points_trav, and points_rgb along the last axis
-		# points = np.hstack((points_xyz.astype(dtype), points_trav.astype(dtype), points_rgb_uint32))
-
+		num_points = len(point_cloud)
+		
 		# Define a structured numpy dtype
 		dtype = np.dtype([
 			('x', np.float32),
@@ -402,17 +381,30 @@ class CTraversability(Node):
 			('rgb', np.uint32)
 		])
 
-		# Create a structured array
-		points_structured = np.zeros(points_xyz.shape[0], dtype=dtype)
-		points_structured['x'] = points_xyz[:, 0]
-		points_structured['y'] = points_xyz[:, 1]
-		points_structured['z'] = points_xyz[:, 2]
-		points_structured['intensity'] = points_trav
-		points_structured['rgb'] = points_rgb_uint32
+		# Prepare the structured array for results
+		points_structured = np.zeros(num_points, dtype=dtype)
 
-		# Convert data to bytes
-		# data = points.tobytes()#.astype(dtype)
-		# # Convert the structured array to bytes
+		# Allocate device memory and transfer data
+		d_pixels = cuda.to_device(pixels)
+		d_point_cloud = cuda.to_device(point_cloud)
+		d_traversability_image = cuda.to_device(traversability_image)
+		d_rgb_image = cuda.to_device(rgb_image)
+
+		d_structured_points = cuda.to_device(points_structured)
+
+		# Define CUDA grid size
+		threads_per_block = 128
+		blocks_per_grid = (num_points + (threads_per_block - 1)) // threads_per_block
+
+		# Launch the CUDA kernel
+		process_pixels[blocks_per_grid, threads_per_block](
+			d_pixels, d_point_cloud, d_traversability_image, d_rgb_image, d_structured_points,
+		)
+
+		# Copy the results back to host memory
+		points_structured = d_structured_points.copy_to_host()
+
+		# Convert the structured array to bytes
 		data = points_structured.tobytes()
 
 		# Define PointCloud2 fields
@@ -420,7 +412,7 @@ class CTraversability(Node):
 			PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
 			PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
 			PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
-			PointField(name='traversability', offset=12, datatype=PointField.FLOAT32, count=1),
+			PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
 			PointField(name='rgb', offset=16, datatype=PointField.UINT32, count=1)
 		]
 
@@ -436,7 +428,110 @@ class CTraversability(Node):
 			point_step=points_structured.itemsize,
 			row_step=(points_structured.itemsize * points_structured.shape[0]),
 			data=data
-		), depth_ol
+		)
+	
+	# def create_point_cloud2(self, rgb_image, traversability_image, point_cloud):
+
+	# 	# Cobvert pointcloud to pixels
+	# 	pixels, _ = cv2.projectPoints(point_cloud, self.rvec, self.tvec, self.camera_matrix, self.dist_coeffs)
+
+	# 	depth_ol = rgb_image.copy()
+
+	# 	points_xyz = []
+	# 	points_trav = []
+	# 	points_rgb = []
+
+	# 	# Iterate over pixels and process
+	# 	for idxPixel, pixel in enumerate(pixels):
+	# 		# Extract coordinates from pixel
+	# 		px, py = pixel[0]
+			
+	# 		# Safely convert coordinates to integers
+	# 		px = self.safe_convert_to_int(px)
+	# 		py = self.safe_convert_to_int(py)
+			
+	# 		# Check if coordinates are within bounds
+	# 		if px < self.width and py < self.height and px >= 0 and py >= 0 and point_cloud[idxPixel][0] > self.tvec[0]:
+	# 			depth = int(np.linalg.norm(point_cloud[idxPixel]) * 255 / MAX_RANGE)
+	# 			if depth > 255:
+	# 				depth = 255
+				
+	# 			color_range = self.cmaplist[depth]
+	# 			depth_ol = cv2.circle(depth_ol, (px, py), 2, (int(color_range[0] * 255), int(color_range[1] * 255), int(color_range[2] * 255)), -1)
+				
+	# 			points_xyz.append([point_cloud[idxPixel][0], point_cloud[idxPixel][1], point_cloud[idxPixel][2]])
+	# 			points_trav.append(traversability_image[py, px])
+	# 			points_rgb.append(rgb_image[py, px])
+	# 			#print(rgb_image[py, px])
+
+	# 	# print("Points...")
+
+	# 	points_xyz = np.array(points_xyz)
+	# 	points_trav = np.array(points_trav)
+	# 	points_rgb = np.array(points_rgb)
+
+	# 	# # Define data type for ROS PointCloud2
+	# 	# ros_dtype = PointField.FLOAT32
+	# 	# dtype = np.float32
+	# 	# itemsize = np.dtype(dtype).itemsize  # A 32-bit float takes 4 bytes
+
+	# 	# Add a new axis to points_trav to match the dimensions for concatenation
+	# 	# points_trav = points_trav[:, np.newaxis]  # Shape will be (number_of_points, 1)
+
+	# 	# Convert points_rgb to a single uint32 value per point
+	# 	points_rgb_uint32 = np.left_shift(points_rgb[:, 0].astype(np.uint32), 16) + \
+	# 						np.left_shift(points_rgb[:, 1].astype(np.uint32), 8) + \
+	# 						points_rgb[:, 2].astype(np.uint32)
+	# 	# points_rgb_uint32 = points_rgb_uint32[:, np.newaxis]  # Shape will be (number_of_points, 1)
+
+	# 	# # Concatenate points_xyz, points_trav, and points_rgb along the last axis
+	# 	# points = np.hstack((points_xyz.astype(dtype), points_trav.astype(dtype), points_rgb_uint32))
+
+	# 	# Define a structured numpy dtype
+	# 	dtype = np.dtype([
+	# 		('x', np.float32),
+	# 		('y', np.float32),
+	# 		('z', np.float32),
+	# 		('intensity', np.float32),
+	# 		('rgb', np.uint32)
+	# 	])
+
+	# 	# Create a structured array
+	# 	points_structured = np.zeros(points_xyz.shape[0], dtype=dtype)
+	# 	points_structured['x'] = points_xyz[:, 0]
+	# 	points_structured['y'] = points_xyz[:, 1]
+	# 	points_structured['z'] = points_xyz[:, 2]
+	# 	points_structured['intensity'] = points_trav
+	# 	points_structured['rgb'] = points_rgb_uint32
+
+	# 	# Convert data to bytes
+	# 	# data = points.tobytes()#.astype(dtype)
+	# 	# # Convert the structured array to bytes
+	# 	data = points_structured.tobytes()
+
+	# 	# Define PointCloud2 fields
+	# 	fields = [
+	# 		PointField(name='x', offset=0, datatype=PointField.FLOAT32, count=1),
+	# 		PointField(name='y', offset=4, datatype=PointField.FLOAT32, count=1),
+	# 		PointField(name='z', offset=8, datatype=PointField.FLOAT32, count=1),
+	# 		PointField(name='intensity', offset=12, datatype=PointField.FLOAT32, count=1),
+	# 		PointField(name='rgb', offset=16, datatype=PointField.UINT32, count=1)
+	# 	]
+
+	# 	header = Header(frame_id=FRAME)
+	# 	header.stamp = self.get_clock().now().to_msg()
+
+	# 	return PointCloud2(
+	# 		header=header,
+	# 		height=1,
+	# 		width=points_structured.shape[0],
+	# 		is_dense=False,
+	# 		is_bigendian=False,
+	# 		fields=fields,
+	# 		point_step=points_structured.itemsize,
+	# 		row_step=(points_structured.itemsize * points_structured.shape[0]),
+	# 		data=data
+	# 	), depth_ol
 		
 if __name__ == '__main__':
 	rclpy.init()
