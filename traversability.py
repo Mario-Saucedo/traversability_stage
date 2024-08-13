@@ -90,7 +90,7 @@ def process_pixels(pixels, point_cloud, traversability_image, rgb_image, structu
 		py = int(py)
 
 		# Check if coordinates are within bounds
-		if 0 <= px < width and 0 <= py < height:# and point_cloud[idx][0] > tvec[0]:
+		if 100 <= px < width-100 and height/2 <= py < height:# and point_cloud[idx][0] > tvec[0]:
 			# # Calculate depth
 			# depth = int(np.linalg.norm(point_cloud[idx]) * 255 / max_range)
 			# if depth > 255:
@@ -112,14 +112,14 @@ class CTraversability(Node):
 		self.bridge = CvBridge()
 		
 		# Create subscribers for RGB, depth images, and point cloud
-		self.rgb_sub = Subscriber(self, Image, '/husky1/camera/color/image_raw')
-		self.depth_sub = Subscriber(self, Image, '/husky1/camera/aligned_depth_to_color/image_raw')
-		self.pcl_sub = Subscriber(self, PointCloud2, '/husky1/lidar_points')
+		self.rgb_sub = Subscriber(self, Image, '/husky/camera/color/image_raw')
+		self.depth_sub = Subscriber(self, Image, '/husky/camera/aligned_depth_to_color/image_raw')
+		self.pcl_sub = Subscriber(self, PointCloud2, '/husky/lidar_points')
 
 		# Create subscribers for camra info
 		self.intrinsics_sub = self.create_subscription(
 			CameraInfo,
-			'/husky1/camera/color/camera_info',  # Topic name might vary, adjust as needed
+			'/husky/camera/color/camera_info',  # Topic name might vary, adjust as needed
 			self.callback_intrinsics,
 			1)
 
@@ -128,11 +128,11 @@ class CTraversability(Node):
 		self.ts.registerCallback(self.callback)
 		
 		# Publishers
-		self.traversability_pub = self.create_publisher(Image, '/traversability/image_raw', 1)
-		self.segmentation_pub = self.create_publisher(Image, '/traversability/segmentation/image_raw', 1)
-		self.normals_pub = self.create_publisher(Image, '/traversability/surface_nromals/image_raw', 1)
-		self.trav_pcl_pub = self.create_publisher(PointCloud2, "/traversability/points", 1)
-		self.depth_ol_pub = self.create_publisher(Image, "/lidar/aligned_range_to_image/image_raw", 1)
+		self.traversability_pub = self.create_publisher(Image, '/husky/traversability/image_raw', 1)
+		self.segmentation_pub = self.create_publisher(Image, '/husky/traversability/segmentation/image_raw', 1)
+		self.normals_pub = self.create_publisher(Image, '/husky/traversability/surface_nromals/image_raw', 1)
+		self.trav_pcl_pub = self.create_publisher(PointCloud2, "/husky/traversability/points", 1)
+		# self.depth_ol_pub = self.create_publisher(Image, "/lidar/aligned_range_to_image/image_raw", 1)
 
 		#-----------Default intrinsics---------------#
 		self.height = 720
@@ -165,7 +165,7 @@ class CTraversability(Node):
 		self.width = data.width
 		self.camera_matrix = np.asarray(data.k).reshape((3, 3))
 		self.dist_coeffs = np.asarray(data.d)
-		self.get_logger().info(f"Camera Matrix: {self.camera_matrix}, Dist Coeffs: {self.dist_coeffs}")
+		# self.get_logger().info(f"Camera Matrix: {self.camera_matrix}, Dist Coeffs: {self.dist_coeffs}")
 		# self.intrinsics_sub.reset()
 	
 	def callback(self, rgb_msg, depth_msg, pcl_msg):
@@ -175,12 +175,12 @@ class CTraversability(Node):
 
 		# Calculate the normals of the depth image
 		normals_image, normals_x = self.calculate_normals(depth_image)
-		print("Normals...")
+		# print("Normals...")
 
 		# Apply semantic segmentation to the image
 		rgb_image = cv2.cvtColor(bgr_image , cv2.COLOR_BGR2RGB)
 		segmentation_image = self.semantic_segmentation(rgb_image)
-		print("Segmentation...")
+		# print("Segmentation...")
 
 		#print("New data")
 
@@ -188,7 +188,7 @@ class CTraversability(Node):
 		traversability_image = self.compute_traversability(segmentation_image, normals_x)
 		dilation_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
 		traversability_image = cv2.dilate(traversability_image, dilation_kernel, iterations=5)
-		print("Traversability YAY!!!!")
+		# print("Traversability YAY!!!!")
 		
 		# Convert the image back to a ROS Image message
 		normals_msg = self.bridge.cv2_to_imgmsg(normals_image, encoding='rgb8')
@@ -205,6 +205,8 @@ class CTraversability(Node):
 
 		point_cloud_msg = self.create_point_cloud2(rgb_image, traversability_image, point_cloud)
 		self.trav_pcl_pub.publish(point_cloud_msg)
+
+		print("Traversability YAY!!!!")
 
 		#self.depth_ol_pub.publish(self.bridge.cv2_to_imgmsg(depth_ol, 'rgb8'))
 
