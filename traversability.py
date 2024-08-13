@@ -26,7 +26,8 @@ DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 # OUT_CHANNELS = 6
 IMAGE_HEIGHT = 360
 IMAGE_WIDTH = 640
-MODEL_PATH = './model_lraspp.pt'
+# MODEL_PATH = './model_lraspp.pt'
+MODEL_PATH = './seg02.pt'
 
 MAX_RANGE = 15
 FRAME = "hesai_lidar"
